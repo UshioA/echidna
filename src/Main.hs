@@ -30,7 +30,6 @@ import Echidna.Output.Source
 import Echidna.Solidity (compileContracts)
 import Echidna.Test (reproduceTest, validateTestMode)
 import Echidna.Types.Campaign
-import Echidna.Types.Campaign (defaultJSONFilePath)
 import Echidna.Types.Config
 import Echidna.Types.Solidity
 import Echidna.Types.Test (EchidnaTest (..), TestMode)
@@ -161,16 +160,15 @@ bool = maybeReader (f . map toLower)
 
 options :: Parser Options
 options =
-  Options
-    <$> ( NE.fromList
-            <$> some
-              ( argument
-                  str
-                  ( metavar "FILES"
-                      <> help "Solidity files to analyze"
-                  )
-              )
+  ( Options . NE.fromList
+      <$> some
+        ( argument
+            str
+            ( metavar "FILES"
+                <> help "Solidity files to analyze"
+            )
         )
+  )
     <*> optional
       ( option auto $
           long "workers"
