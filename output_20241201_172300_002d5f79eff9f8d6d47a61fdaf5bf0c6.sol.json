@@ -1,0 +1,96 @@
+{
+    "timing": {
+        "engine_exec_time": 0.11417818069458008,
+        "summary_time": 0.0012922286987304688,
+        "state_machine_build_time": 2.6531758308410645,
+        "total_run_time": 2.7691028118133545
+    },
+    "deleted_paths": {
+        "length_1": 0,
+        "length_2": 0,
+        "length_3": 0
+    },
+    "state_comparison": {
+        "original_transition_count": 49,
+        "pruned_transition_count": 49,
+        "transition_count_diff": 0,
+        "transition_reduction_rate": 0.0
+    },
+    "state_machine": {
+        "states": [
+            "IcoToken",
+            "transfer",
+            "approve",
+            "balanceOf",
+            "setIcoContract",
+            "sell",
+            "issue"
+        ],
+        "transitions_accept": {
+            "issue": [
+                "issue",
+                "sell",
+                "setIcoContract",
+                "balanceOf",
+                "approve",
+                "transfer",
+                "IcoToken"
+            ],
+            "sell": [
+                "issue",
+                "sell",
+                "setIcoContract",
+                "balanceOf",
+                "approve",
+                "transfer",
+                "IcoToken"
+            ],
+            "setIcoContract": [
+                "issue",
+                "sell",
+                "setIcoContract",
+                "balanceOf",
+                "approve",
+                "transfer",
+                "IcoToken"
+            ],
+            "balanceOf": [
+                "issue",
+                "sell",
+                "setIcoContract",
+                "balanceOf",
+                "approve",
+                "transfer",
+                "IcoToken"
+            ],
+            "approve": [
+                "issue",
+                "sell",
+                "setIcoContract",
+                "balanceOf",
+                "approve",
+                "transfer",
+                "IcoToken"
+            ],
+            "transfer": [
+                "issue",
+                "sell",
+                "setIcoContract",
+                "balanceOf",
+                "approve",
+                "transfer",
+                "IcoToken"
+            ],
+            "IcoToken": [
+                "issue",
+                "sell",
+                "setIcoContract",
+                "balanceOf",
+                "approve",
+                "transfer",
+                "IcoToken"
+            ]
+        },
+        "transitions_reject": {}
+    }
+}
