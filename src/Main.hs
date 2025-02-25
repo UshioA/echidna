@@ -315,7 +315,7 @@ options =
             <> help ("Number of symbolic execution solvers to run in parallel for each task (assuming sym-exec is enabled). Default is " ++ show defaultSymExecNWorkers)
       )
     <*> optional
-      ( option auto $
+      ( option str $
           long "state-machine-json-file"
             <> metavar "FILEPATH"
             <> help ("Path of state machine represented in json. Default is " ++ show defaultJSONFilePath)
@@ -370,7 +370,8 @@ overrideConfig config Options {..} = do
           symExec = fromMaybe campaignConf.symExec cliSymExec,
           symExecTargets = (\t -> Just [t]) =<< cliSymExecTargets,
           symExecTimeout = fromMaybe campaignConf.symExecTimeout cliSymExecTimeout,
-          symExecNSolvers = fromMaybe campaignConf.symExecNSolvers cliSymExecNSolvers
+          symExecNSolvers = fromMaybe campaignConf.symExecNSolvers cliSymExecNSolvers,
+          stateMachineJson = cliStateMachineJson
         }
 
     overrideSolConf solConf =

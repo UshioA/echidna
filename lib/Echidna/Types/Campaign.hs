@@ -24,6 +24,8 @@ data CampaignConf = CampaignConf
     -- | Number of calls between state resets (e.g. \"every 10 calls,
     -- reset the state to avoid unrecoverable states/save memory\"
     seqLen :: Int,
+    -- | Filepath of state machine json, used to reduce invalid call chain, nullable
+    stateMachineJson :: Maybe String,
     -- | Maximum number of candidate sequences to evaluate while shrinking
     shrinkLimit :: Int,
     -- | If applicable, initially known coverage. If this is 'Nothing',
@@ -175,6 +177,10 @@ data WorkerState = WorkerState
     ncallseqs :: !Int,
     -- | Number of calls executed while fuzzing
     ncalls :: !Int,
+    -- | Flag to indicate that the callseq has reverted
+    callseqReverted :: !Bool,
+    -- | Number of calls executed before the first revert
+    revertAt :: !Int,
     -- | Total gas consumed while fuzzing
     totalGas :: !Int,
     -- | Extra threads currently being run,
@@ -191,6 +197,8 @@ initialWorkerState =
       newCoverage = False,
       ncallseqs = 0,
       ncalls = 0,
+      callseqReverted = False,
+      revertAt = 0,
       totalGas = 0,
       runningThreads = []
     }
@@ -220,6 +228,12 @@ defaultSymExecAskSMTIters = 1
 
 defaultJSONFilePath :: String
 defaultJSONFilePath = ""
+
+defaultStateMachineJson :: Maybe String
+defaultStateMachineJson = Nothing
+
+-- defaultStateMachine :: Maybe StateMachine
+-- defaultStateMachine = Nothing
 
 -- | Get number of fuzzing workers (doesn't include sym exec worker)
 -- Defaults to `N` if set to Nothing, where `N` is Haskell's -N value,

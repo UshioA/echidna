@@ -1,3 +1,4 @@
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 
@@ -5,19 +6,17 @@ module Echidna.Campaign where
 
 import Control.Concurrent
 import Control.DeepSeq (force)
-import Control.Monad (forM_, replicateM, unless, void, when)
 import Control.Monad.Catch (MonadThrow (..))
-import Control.Monad.Random.Strict (MonadRandom, RandT, evalRandT)
-import Control.Monad.Reader (MonadReader, ask, asks, liftIO)
+import Control.Monad.Random
+import Control.Monad.Random.Strict (RandT, evalRandT)
+import Control.Monad.Reader (MonadReader, ask, asks)
 import Control.Monad.ST (RealWorld)
 import Control.Monad.State.Strict
-  ( MonadIO,
-    MonadState (..),
+  ( MonadState (..),
     StateT (..),
     gets,
     modify',
   )
-import Control.Monad.Trans (lift)
 import Data.Aeson ()
 import Data.Binary.Get (runGetOrFail)
 import Data.ByteString.Lazy qualified as LBS
@@ -26,7 +25,7 @@ import Data.IORef (atomicModifyIORef', readIORef, writeIORef)
 import Data.List qualified as List
 import Data.Map (Map, (\\))
 import Data.Map qualified as Map
-import Data.Maybe (isJust, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -39,7 +38,7 @@ import Echidna.ABI
 import Echidna.Exec
 import Echidna.Mutator.Corpus
 import Echidna.Shrink (shrinkTest)
-import Echidna.StateMachine
+import Echidna.StateMachine qualified as StateMachine
 import Echidna.SymExec (createSymTx)
 import Echidna.Symbolic (forceAddr)
 import Echidna.Test
@@ -50,13 +49,29 @@ import Echidna.Types.Config
 import Echidna.Types.Corpus (Corpus, corpusSize)
 import Echidna.Types.Coverage (coverageStats)
 import Echidna.Types.Signature (FunctionName)
+import Echidna.Types.StateMachine
 import Echidna.Types.Test
+  ( EchidnaTest
+      ( reproducer,
+        result,
+        state,
+        testType,
+        value,
+        vm,
+        workerId
+      ),
+    TestState (Failed, Large, Open, Passed, Solved),
+    TestType (OptimizationTest),
+    TestValue (BoolValue, IntValue),
+    isOpen,
+    isOptimizationTest,
+  )
 import Echidna.Types.Test qualified as Test
-import Echidna.Types.Tx (Tx (..), TxCall (..))
+import Echidna.Types.Tx (Tx (..), TxCall (..), hasReverted)
+import Echidna.Types.World
 import Echidna.Utility (getTimestamp)
-import System.Random (mkStdGen)
 
-instance (MonadThrow m) => MonadThrow (RandT g m) where
+instance (MonadThrow m) => MonadThrow (Control.Monad.Random.Strict.RandT g m) where
   throwM = lift . throwM
 
 -- | Given a 'Campaign', check if the test results should be reported as a
@@ -132,7 +147,7 @@ runSymWorker callback vm dict workerId initialCorpus name = do
   chan <- liftIO $ dupChan eventQueue
 
   flip runStateT initialState $
-    flip evalRandT (mkStdGen effectiveSeed) $ do
+    flip Control.Monad.Random.Strict.evalRandT (mkStdGen effectiveSeed) $ do
       -- unused but needed for callseq
       lift callback
       void $ replayCorpus vm initialCorpus
@@ -150,6 +165,8 @@ runSymWorker callback vm dict workerId initialCorpus name = do
           genDict = effectiveGenDict,
           newCoverage = False,
           ncallseqs = 0,
+          callseqReverted = False,
+          revertAt = 0,
           ncalls = 0,
           totalGas = 0,
           runningThreads = []
@@ -233,12 +250,14 @@ runFuzzWorker callback vm dict workerId initialCorpus testLimit = do
             newCoverage = False,
             ncallseqs = 0,
             ncalls = 0,
+            callseqReverted = False,
+            revertAt = 0,
             totalGas = 0,
             runningThreads = []
           }
 
   flip runStateT initialState $ do
-    flip evalRandT (mkStdGen effectiveSeed) $ do
+    flip Control.Monad.Random.Strict.evalRandT (mkStdGen effectiveSeed) $ do
       lift callback
       void $ replayCorpus vm initialCorpus
       run
@@ -321,6 +340,7 @@ randseq deployedContracts = do
 
   let mutConsts = env.cfg.campaignConf.mutConsts
       seqLen = env.cfg.campaignConf.seqLen
+      stateMachineJsonPath = env.cfg.campaignConf.stateMachineJson
 
   -- TODO: include reproducer when optimizing
   -- let rs = filter (not . null) $ map (.testReproducer) $ ca._tests
@@ -328,8 +348,19 @@ randseq deployedContracts = do
   -- Generate new random transactions
 
   -- TODO I think i should change the way of generating randTxs
+  -- 读取并解析 stateMachineJson 文件
+  stateMachine <- case stateMachineJsonPath of
+    Just path -> do
+      result <- liftIO $ StateMachine.readJsonFile path
+      case result of
+        Left err -> error $ "Error reading state machine: " ++ err
+        Right sm -> return $ Just sm
+    Nothing -> return Nothing
 
-  randTxs <- replicateM seqLen (genTx world deployedContracts)
+  -- 生成调用链
+  randTxs <- case stateMachine of
+    Just sm -> generateValidSequence sm seqLen world deployedContracts
+    Nothing -> replicateM seqLen (genTx world deployedContracts)
   -- Generate a random mutator
   cmut <-
     if seqLen == 1
@@ -341,6 +372,41 @@ randseq deployedContracts = do
   if null corpus
     then pure randTxs -- Use the generated random transactions
     else mut seqLen corpus randTxs -- Apply the mutator
+
+-- 生成满足状态机约束的调用链
+generateValidSequence ::
+  (MonadRandom m, MonadIO m, MonadState WorkerState m, MonadReader Env m) =>
+  StateMachine ->
+  Int ->
+  World ->
+  Map (Expr 'EAddr) Contract ->
+  m [Tx]
+generateValidSequence (StateMachine _states _transitionsAccept _) seqLen world deployedContracts = do
+  gen' <- getStdGen
+  let (rand_start, gen) = randomR (0, length _states - 1) gen'
+  let initialState = _states !! rand_start
+  go seqLen gen initialState
+  where
+    go 0 _ _ = return []
+    go n g currentState = do
+      tx <- genTxWithFunctionName world deployedContracts currentState
+      let possibleValid :: [Text] = fromMaybe [] (Map.lookup currentState _transitionsAccept)
+      let (rand_idx, gen) = randomR (0, length possibleValid - 1) g
+      let new_func_namne = possibleValid !! rand_idx
+      rest <- go (n - 1) gen new_func_namne
+      return (tx : rest)
+
+-- tx <- genTx world deployedContracts
+-- let functionName = case tx.call of
+--       SolCall (fname, _) -> fname
+--       _ -> error "Unexpected TxCall type"
+-- let txFunctionName = functionName
+-- if maybe False (txFunctionName `elem`) (Map.lookup currentState _transitionsAccept)
+--   then do
+--     rest <- go (n - 1) g txFunctionName
+--     return (tx : rest)
+--   else do
+--     go n g currentState
 
 -- TODO callseq ideally shouldn't need to be MonadRandom
 
@@ -384,6 +450,7 @@ callseq vm txSeq = do
           transactions = fst <$> results
         }
 
+  -- TODO SOLFUSE: Maybe do adjustment here based on revert or not
   modify' $ \workerState ->
     let -- compute the addresses not present in the old VM via set difference
         newAddrs = Map.keys $ vm'.env.contracts \\ vm.env.contracts
@@ -500,16 +567,21 @@ evalSeq vm0 execFunc = go vm0 []
       -- NOTE: we do reverse here because we build up this list by prepending,
       -- see the last line of this function.
       updateTests (updateOpenTest vm (reverse executedSoFar))
+      -- TODO SOLFUSE: should change to update based on revert or not (result returned by `execFunc')
       modify' $ \workerState -> workerState {ncalls = workerState.ncalls + 1}
       case toExecute of
         [] -> pure ([], vm)
         (tx : remainingTxs) -> do
           (result, vm') <- execFunc vm tx
           modify' $ \workerState -> workerState {totalGas = workerState.totalGas + fromIntegral (vm'.burned - vm.burned)}
+          -- modify' $ \workerState -> workerState {totalGas = workerState.totalGas + fromIntegral (vm'.burned - vm.burned)}
           -- NOTE: we don't use the intermediate VMs, just the last one. If any of
           -- the intermediate VMs are needed, they can be put next to the result
           -- of each transaction - `m ([(Tx, result, VM)])`
           (remaining, _vm) <- go vm' (tx : executedSoFar) remainingTxs
+          let nowat = length executedSoFar + 1
+          let reverted = hasReverted vm'
+          when reverted $ modify' $ \workerState -> workerState {revertAt = nowat, callseqReverted = True, ncalls = workerState.ncalls - 1}
           pure ((tx, result) : remaining, vm')
 
 -- | Update tests based on the return value from the given function.
