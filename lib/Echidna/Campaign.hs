@@ -1,6 +1,7 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# OPTIONS_GHC -Wno-overlapping-patterns #-}
 
 module Echidna.Campaign where
 
@@ -23,13 +24,14 @@ import Data.ByteString.Lazy qualified as LBS
 import Data.Foldable (foldlM)
 import Data.IORef (atomicModifyIORef', readIORef, writeIORef)
 import Data.List qualified as List
+import Data.List.NonEmpty (NonEmpty)
 import Data.Map (Map, (\\))
 import Data.Map qualified as Map
-import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
-import Data.Time (LocalTime)
+import Data.Time (LocalTime, diffLocalTime, diffUTCTime, getCurrentTime)
 import EVM (cheatCode)
 import EVM.ABI (AbiType (AbiAddressType), AbiValue (AbiAddress), getAbi)
 import EVM.Dapp (DappInfo (..))
@@ -38,6 +40,7 @@ import Echidna.ABI
 import Echidna.Exec
 import Echidna.Mutator.Corpus
 import Echidna.Shrink (shrinkTest)
+import Echidna.SourceMapping (lookupUsingCodehash)
 import Echidna.StateMachine qualified as StateMachine
 import Echidna.SymExec (createSymTx)
 import Echidna.Symbolic (forceAddr)
@@ -48,7 +51,8 @@ import Echidna.Types.Campaign
 import Echidna.Types.Config
 import Echidna.Types.Corpus (Corpus, corpusSize)
 import Echidna.Types.Coverage (coverageStats)
-import Echidna.Types.Signature (FunctionName)
+import Echidna.Types.Random (rElem')
+import Echidna.Types.Signature (ContractA, FunctionName, SignatureMap, SolCall, SolSignature (..))
 import Echidna.Types.StateMachine
 import Echidna.Types.Test
   ( EchidnaTest
@@ -70,6 +74,7 @@ import Echidna.Types.Test qualified as Test
 import Echidna.Types.Tx (Tx (..), TxCall (..), hasReverted)
 import Echidna.Types.World
 import Echidna.Utility (getTimestamp)
+import Text.Printf (printf)
 
 instance (MonadThrow m) => MonadThrow (Control.Monad.Random.Strict.RandT g m) where
   throwM = lift . throwM
@@ -253,6 +258,10 @@ runFuzzWorker callback vm dict workerId initialCorpus testLimit = do
             callseqReverted = False,
             revertAt = 0,
             totalGas = 0,
+            totalExecTime = 0,
+            totalGenTime = 0,
+            avgGenTime = 0,
+            avgExecTime = 0,
             runningThreads = []
           }
 
@@ -335,6 +344,7 @@ randseq ::
   Map (Expr 'EAddr) Contract ->
   m [Tx]
 randseq deployedContracts = do
+  startTime <- liftIO getTimestamp
   env <- ask
   let world = env.world
 
@@ -361,6 +371,18 @@ randseq deployedContracts = do
   randTxs <- case stateMachine of
     Just sm -> generateValidSequence sm seqLen world deployedContracts
     Nothing -> replicateM seqLen (genTx world deployedContracts)
+
+  endTime <- liftIO getTimestamp
+  let genTime = realToFrac $ diffLocalTime endTime startTime
+
+  modify' $ \workerState ->
+    workerState
+      { totalGenTime = workerState.totalGenTime + genTime,
+        avgGenTime = (workerState.totalGenTime + genTime) / fromIntegral (workerState.ncallseqs + 1)
+      }
+
+  -- liftIO $ printf "Sequence generation time: %.6f seconds\n" genTime
+
   -- Generate a random mutator
   cmut <-
     if seqLen == 1
@@ -381,32 +403,45 @@ generateValidSequence ::
   World ->
   Map (Expr 'EAddr) Contract ->
   m [Tx]
-generateValidSequence (StateMachine _states _transitionsAccept _) seqLen world deployedContracts = do
+generateValidSequence (StateMachine _states _contract _transitionsAccept _transitionsReject) seqLen world deployedContracts = do
   gen' <- getStdGen
-  let (rand_start, gen) = randomR (0, length _states - 1) gen'
-  let initialState = _states !! rand_start
-  go seqLen gen initialState
+  let (rand_idx, gen) = randomR (0, length _states - 1) (gen' :: StdGen)
+  let cons = Map.lookup "constructor" _transitionsAccept
+  name <- case cons of
+    Just _ -> return "constructor"
+    Nothing -> do
+      let cons2 = Map.lookup _contract _transitionsAccept
+      case cons2 of
+        Just _ -> return _contract
+        Nothing -> do
+          return (_states !! rand_idx)
+  case name of
+    "constructor" -> go seqLen gen name
+    _contract -> go seqLen gen name
+    _ -> genTxWithFunctionName world deployedContracts name >>= \tx -> go (seqLen - 1) gen name >>= \rest -> return (tx : rest)
   where
+    -- go seqLen gen name
+
     go 0 _ _ = return []
     go n g currentState = do
-      tx <- genTxWithFunctionName world deployedContracts currentState
-      let possibleValid :: [Text] = fromMaybe [] (Map.lookup currentState _transitionsAccept)
-      let (rand_idx, gen) = randomR (0, length possibleValid - 1) g
-      let new_func_namne = possibleValid !! rand_idx
-      rest <- go (n - 1) gen new_func_namne
-      return (tx : rest)
+      -- tx <- genTxWithFunctionName world deployedContracts currentState
+      -- let possibleValid :: [Text] = fromMaybe [] (Map.lookup currentState _transitionsAccept)
+      -- let (rand_idx, gen) = randomR (0, length possibleValid - 1) g
+      -- let new_func_namne = possibleValid !! rand_idx
+      -- rest <- go (n - 1) gen new_func_namne
+      -- return (tx : rest)
 
--- tx <- genTx world deployedContracts
--- let functionName = case tx.call of
---       SolCall (fname, _) -> fname
---       _ -> error "Unexpected TxCall type"
--- let txFunctionName = functionName
--- if maybe False (txFunctionName `elem`) (Map.lookup currentState _transitionsAccept)
---   then do
---     rest <- go (n - 1) g txFunctionName
---     return (tx : rest)
---   else do
---     go n g currentState
+      tx <- genTx world deployedContracts
+      let functionName = case tx.call of
+            SolCall (fname, _) -> fname
+            _ -> error "Unexpected TxCall type"
+      let txFunctionName = functionName
+      if maybe True (not . (txFunctionName `elem`)) (Map.lookup currentState _transitionsReject)
+        then do
+          rest <- go (n - 1) g txFunctionName
+          return (tx : rest)
+        else do
+          go n g currentState
 
 -- TODO callseq ideally shouldn't need to be MonadRandom
 
@@ -419,6 +454,8 @@ callseq ::
   [Tx] ->
   m (VM Concrete RealWorld, Bool)
 callseq vm txSeq = do
+  startTime <- liftIO getTimestamp
+
   env <- ask
   -- First, we figure out whether we need to execute with or without coverage
   -- optimization and gas info, and pick our execution function appropriately
@@ -429,6 +466,21 @@ callseq vm txSeq = do
   -- Run each call sequentially. This gives us the result of each call
   -- and the new state
   (results, vm') <- evalSeq vm execFunc txSeq
+
+  -- 计算执行时间
+  endTime <- liftIO getTimestamp
+  let execTime = realToFrac $ diffLocalTime endTime startTime :: Double
+
+  -- 更新状态
+  ncallseqs' <- gets (.ncallseqs)
+  modify' $ \ws ->
+    ws
+      { totalExecTime = ws.totalExecTime + execTime,
+        avgExecTime = (ws.totalExecTime + execTime) / fromIntegral (ncallseqs' + 1)
+      }
+
+  -- 可选：记录单次执行时间
+  -- liftIO $ printf "Sequence execution time: %.6f seconds\n" execTime
 
   -- If there is new coverage, add the transaction list to the corpus
   newCoverage <- gets (.newCoverage)
@@ -574,13 +626,14 @@ evalSeq vm0 execFunc = go vm0 []
         (tx : remainingTxs) -> do
           (result, vm') <- execFunc vm tx
           modify' $ \workerState -> workerState {totalGas = workerState.totalGas + fromIntegral (vm'.burned - vm.burned)}
-          -- modify' $ \workerState -> workerState {totalGas = workerState.totalGas + fromIntegral (vm'.burned - vm.burned)}
           -- NOTE: we don't use the intermediate VMs, just the last one. If any of
           -- the intermediate VMs are needed, they can be put next to the result
           -- of each transaction - `m ([(Tx, result, VM)])`
+          let reverted = hasReverted vm'
+          -- when reverted $ liftIO $ putStrLn $ "Reverted at " ++ show tx.call
+          -- unless reverted $ liftIO $ putStrLn $ "Executed at " ++ show tx.call
           (remaining, _vm) <- go vm' (tx : executedSoFar) remainingTxs
           let nowat = length executedSoFar + 1
-          let reverted = hasReverted vm'
           when reverted $ modify' $ \workerState -> workerState {revertAt = nowat, callseqReverted = True, ncalls = workerState.ncalls - 1}
           pure ((tx, result) : remaining, vm')
 

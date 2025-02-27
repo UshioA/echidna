@@ -75,6 +75,7 @@ genTx world deployedContracts = do
   sender <- rElem' world.senders
   contractAList <- liftIO $ mapM (toContractA env sigMap) (toList deployedContracts)
   (dstAddr, dstAbis) <- rElem' $ Set.fromList $ catMaybes contractAList
+  -- liftIO $ print dstAbis
   solCall <- genInteractionsM genDict dstAbis
   value <- genValue txConf.maxValue genDict.dictValues world.payableSigs solCall
   ts <-

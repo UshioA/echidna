@@ -10,8 +10,8 @@ import Control.Exception (AsyncException)
 import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.Reader
-import Control.Monad.State.Strict hiding (state)
 import Control.Monad.ST (RealWorld)
+import Control.Monad.State.Strict hiding (state)
 import Data.ByteString.Lazy qualified as BS
 import Data.List.Split (chunksOf)
 import Data.Map (Map)
@@ -19,18 +19,7 @@ import Data.Maybe (isJust)
 import Data.Sequence ((|>))
 import Data.Text (Text)
 import Data.Time
-import Graphics.Vty.Config (VtyUserConfig, defaultConfig, configInputMap)
-import Graphics.Vty.CrossPlatform (mkVty)
-import Graphics.Vty.Input.Events
-import Graphics.Vty qualified as Vty
-import System.Console.ANSI (hNowSupportsANSI)
-import System.Signal
-import UnliftIO
-  ( MonadUnliftIO, IORef, newIORef, readIORef, hFlush, stdout , writeIORef, timeout)
-import UnliftIO.Concurrent hiding (killThread, threadDelay)
-
-import EVM.Types (Addr, Contract, VM, VMType(Concrete), W256)
-
+import EVM.Types (Addr, Contract, VM, VMType (Concrete), W256)
 import Echidna.ABI
 import Echidna.Campaign (runWorker, spawnListener)
 import Echidna.Output.Corpus (saveCorpusEvent)
@@ -41,53 +30,75 @@ import Echidna.Types.Campaign
 import Echidna.Types.Config
 import Echidna.Types.Corpus qualified as Corpus
 import Echidna.Types.Coverage (coverageStats)
-import Echidna.Types.Test (EchidnaTest(..), didFail, isOptimizationTest)
+import Echidna.Types.Test (EchidnaTest (..), didFail, isOptimizationTest)
 import Echidna.Types.Tx (Tx)
 import Echidna.UI.Report
 import Echidna.UI.Widgets
-import Echidna.Utility (timePrefix, getTimestamp)
+import Echidna.Utility (getTimestamp, timePrefix)
+import Graphics.Vty qualified as Vty
+import Graphics.Vty.Config (VtyUserConfig, configInputMap, defaultConfig)
+import Graphics.Vty.CrossPlatform (mkVty)
+import Graphics.Vty.Input.Events
+import System.Console.ANSI (hNowSupportsANSI)
+import System.Signal
+import Text.Printf (printf)
+import UnliftIO
+  ( IORef,
+    MonadUnliftIO,
+    hFlush,
+    newIORef,
+    readIORef,
+    stdout,
+    timeout,
+    writeIORef,
+  )
+import UnliftIO.Concurrent hiding (killThread, threadDelay)
 
-data UIEvent =
-  CampaignUpdated LocalTime [EchidnaTest] [WorkerState]
-  | FetchCacheUpdated (Map Addr (Maybe Contract))
-                      (Map Addr (Map W256 (Maybe W256)))
+data UIEvent
+  = CampaignUpdated LocalTime [EchidnaTest] [WorkerState]
+  | FetchCacheUpdated
+      (Map Addr (Maybe Contract))
+      (Map Addr (Map W256 (Maybe W256)))
   | EventReceived (LocalTime, CampaignEvent)
 
 -- | Set up and run an Echidna 'Campaign' and display interactive UI or
 -- print non-interactive output in desired format at the end
-ui
-  :: (MonadCatch m, MonadReader Env m, MonadUnliftIO m)
-  => VM Concrete RealWorld -- ^ Initial VM state
-  -> GenDict
-  -> [(FilePath, [Tx])]
-  -> Maybe Text
-  -> m [WorkerState]
+ui ::
+  (MonadCatch m, MonadReader Env m, MonadUnliftIO m) =>
+  -- | Initial VM state
+  VM Concrete RealWorld ->
+  GenDict ->
+  [(FilePath, [Tx])] ->
+  Maybe Text ->
+  m [WorkerState]
 ui vm dict initialCorpus cliSelectedContract = do
   env <- ask
   conf <- asks (.cfg)
   terminalPresent <- liftIO isTerminal
 
-  let
-    nFuzzWorkers = getNFuzzWorkers conf.campaignConf
-    nworkers = getNWorkers conf.campaignConf
+  let nFuzzWorkers = getNFuzzWorkers conf.campaignConf
+      nworkers = getNWorkers conf.campaignConf
 
-    effectiveMode = case conf.uiConf.operationMode of
-      Interactive | not terminalPresent -> NonInteractive Text
-      other -> other
+      effectiveMode = case conf.uiConf.operationMode of
+        Interactive | not terminalPresent -> NonInteractive Text
+        other -> other
 
-    -- Distribute over all workers, could be slightly bigger overall due to
-    -- ceiling but this doesn't matter
-    perWorkerTestLimit = ceiling
-      (fromIntegral conf.campaignConf.testLimit / fromIntegral nFuzzWorkers :: Double)
+      -- Distribute over all workers, could be slightly bigger overall due to
+      -- ceiling but this doesn't matter
+      perWorkerTestLimit =
+        ceiling
+          (fromIntegral conf.campaignConf.testLimit / fromIntegral nFuzzWorkers :: Double)
 
-    chunkSize = ceiling
-      (fromIntegral (length initialCorpus) / fromIntegral nFuzzWorkers :: Double)
-    corpusChunks = chunksOf chunkSize initialCorpus ++ repeat []
+      chunkSize =
+        ceiling
+          (fromIntegral (length initialCorpus) / fromIntegral nFuzzWorkers :: Double)
+      corpusChunks = chunksOf chunkSize initialCorpus ++ repeat []
 
   corpusSaverStopVar <- spawnListener (saveCorpusEvent env)
 
-  workers <- forM (zip corpusChunks [0..(nworkers-1)]) $
-    uncurry (spawnWorker env perWorkerTestLimit)
+  workers <-
+    forM (zip corpusChunks [0 .. (nworkers - 1)]) $
+      uncurry (spawnWorker env perWorkerTestLimit)
 
   case effectiveMode of
     Interactive -> do
@@ -98,7 +109,6 @@ ui vm dict initialCorpus cliSelectedContract = do
 
       ticker <- liftIO . forkIO . forever $ do
         threadDelay 200_000 -- 200 ms
-
         now <- getTimestamp
         tests <- traverse readIORef env.testRefs
         states <- workerStates workers
@@ -120,27 +130,29 @@ ui vm dict initialCorpus cliSelectedContract = do
       liftIO $ do
         tests <- traverse readIORef env.testRefs
         now <- getTimestamp
-        void $ app UIState
-          { campaigns = [initialWorkerState] -- ugly, fix me
-          , workersAlive = nworkers
-          , status = Uninitialized
-          , timeStarted = now
-          , timeStopped = Nothing
-          , now = now
-          , slitherSucceeded = not $ isEmptySlitherInfo env.slitherInfo
-          , fetchedContracts = mempty
-          , fetchedSlots = mempty
-          , fetchedDialog = B.dialog (Just $ str " Fetched contracts/slots ") Nothing 80
-          , displayFetchedDialog = False
-          , displayLogPane = True
-          , displayTestsPane = True
-          , events = mempty
-          , corpusSize = 0
-          , coverage = 0
-          , numCodehashes = 0
-          , lastNewCov = now
-          , tests
-          }
+        void $
+          app
+            UIState
+              { campaigns = [initialWorkerState], -- ugly, fix me
+                workersAlive = nworkers,
+                status = Uninitialized,
+                timeStarted = now,
+                timeStopped = Nothing,
+                now = now,
+                slitherSucceeded = not $ isEmptySlitherInfo env.slitherInfo,
+                fetchedContracts = mempty,
+                fetchedSlots = mempty,
+                fetchedDialog = B.dialog (Just $ str " Fetched contracts/slots ") Nothing 80,
+                displayFetchedDialog = False,
+                displayLogPane = True,
+                displayTestsPane = True,
+                events = mempty,
+                corpusSize = 0,
+                coverage = 0,
+                numCodehashes = 0,
+                lastNewCov = now,
+                tests
+              }
 
       -- Exited from the UI, stop the workers, not needed anymore
       stopWorkers workers
@@ -154,8 +166,8 @@ ui vm dict initialCorpus cliSelectedContract = do
       liftIO . putStrLn =<< ppCampaign vm states
 
       pure states
-
     NonInteractive outputFormat -> do
+      startTime <- liftIO getTimestamp
       serverStopVar <- newEmptyMVar
 
       -- Handles ctrl-c
@@ -163,7 +175,7 @@ ui vm dict initialCorpus cliSelectedContract = do
         let handler _ = do
               stopWorkers workers
               void $ tryPutMVar serverStopVar ()
-        in installHandler sig handler
+         in installHandler sig handler
 
       let forwardEvent ev = putStrLn =<< runReaderT (ppLogLine vm ev) env
       uiEventsForwarderStopVar <- spawnListener forwardEvent
@@ -171,8 +183,11 @@ ui vm dict initialCorpus cliSelectedContract = do
       let printStatus = do
             states <- liftIO $ workerStates workers
             time <- timePrefix <$> getTimestamp
+            timeElapsed' <- diffLocalTime <$> getTimestamp <*> pure startTime
+            allCalls <- sum . fmap (.ncalls) <$> workerStates workers
+            let callsPerSecond = fromIntegral allCalls / timeElapsed'
             line <- statusLine env states
-            putStrLn $ time <> "[status] " <> line
+            putStrLn $ time <> "[status] " <> line <> ", calls/s: " <> printf "%.2f" (realToFrac callsPerSecond :: Double)
             hFlush stdout
 
       case conf.campaignConf.serverPort of
@@ -206,41 +221,48 @@ ui vm dict initialCorpus cliSelectedContract = do
         None ->
           pure ()
       pure states
-
   where
+    spawnWorker env testLimit corpusChunk workerId = do
+      stateRef <- newIORef initialWorkerState
 
-  spawnWorker env testLimit corpusChunk workerId = do
-    stateRef <- newIORef initialWorkerState
+      threadId <- forkIO $ do
+        -- TODO: maybe figure this out with forkFinally?
+        let workerType = workerIDToType env.cfg.campaignConf workerId
+        stopReason <-
+          catches
+            ( do
+                let timeoutUsecs = maybe (-1) (* 1_000_000) env.cfg.uiConf.maxTime
+                    corpus = if workerType == SymbolicWorker then initialCorpus else corpusChunk
+                maybeResult <-
+                  timeout timeoutUsecs $
+                    runWorker
+                      workerType
+                      (get >>= writeIORef stateRef)
+                      vm
+                      dict
+                      workerId
+                      corpus
+                      testLimit
+                      cliSelectedContract
+                pure $ case maybeResult of
+                  Just (stopReason, _finalState) -> stopReason
+                  Nothing -> TimeLimitReached
+            )
+            [ Handler $ \(e :: AsyncException) -> pure $ Killed (show e),
+              Handler $ \(e :: SomeException) -> pure $ Crashed (show e)
+            ]
 
-    threadId <- forkIO $ do
-      -- TODO: maybe figure this out with forkFinally?
-      let workerType = workerIDToType env.cfg.campaignConf workerId
-      stopReason <- catches (do
-          let
-            timeoutUsecs = maybe (-1) (*1_000_000) env.cfg.uiConf.maxTime
-            corpus = if workerType == SymbolicWorker then initialCorpus else corpusChunk
-          maybeResult <- timeout timeoutUsecs $
-            runWorker workerType (get >>= writeIORef stateRef)
-                      vm dict workerId corpus testLimit cliSelectedContract
-          pure $ case maybeResult of
-            Just (stopReason, _finalState) -> stopReason
-            Nothing -> TimeLimitReached
-        )
-        [ Handler $ \(e :: AsyncException) -> pure $ Killed (show e)
-        , Handler $ \(e :: SomeException)  -> pure $ Crashed (show e)
-        ]
+        time <- liftIO getTimestamp
+        writeChan env.eventQueue (time, WorkerEvent workerId workerType (WorkerStopped stopReason))
 
-      time <- liftIO getTimestamp
-      writeChan env.eventQueue (time, WorkerEvent workerId workerType (WorkerStopped stopReason))
+      pure (threadId, stateRef)
 
-    pure (threadId, stateRef)
+    -- \| Get a snapshot of all worker states
+    workerStates workers =
+      forM workers $ \(_, stateRef) -> readIORef stateRef
 
-  -- | Get a snapshot of all worker states
-  workerStates workers =
-    forM workers $ \(_, stateRef) -> readIORef stateRef
-
- -- | Order the workers to stop immediately
-stopWorkers :: MonadIO m => [(ThreadId, IORef WorkerState)] -> m ()
+-- \| Order the workers to stop immediately
+stopWorkers :: (MonadIO m) => [(ThreadId, IORef WorkerState)] -> m ()
 stopWorkers workers =
   forM_ workers $ \(threadId, workerStateRef) -> do
     workerState <- readIORef workerStateRef
@@ -248,105 +270,136 @@ stopWorkers workers =
 
 vtyConfig :: IO VtyUserConfig
 vtyConfig = do
-  pure defaultConfig { configInputMap = [
-    (Nothing, "\ESC[6;2~", EvKey KPageDown [MShift]),
-    (Nothing, "\ESC[5;2~", EvKey KPageUp [MShift])
-    ] }
+  pure
+    defaultConfig
+      { configInputMap =
+          [ (Nothing, "\ESC[6;2~", EvKey KPageDown [MShift]),
+            (Nothing, "\ESC[5;2~", EvKey KPageUp [MShift])
+          ]
+      }
 
 -- | Check if we should stop drawing (or updating) the dashboard, then do the right thing.
-monitor :: MonadReader Env m => m (App UIState UIEvent Name)
+monitor :: (MonadReader Env m) => m (App UIState UIEvent Name)
 monitor = do
-  let
-    drawUI :: Env -> UIState -> [Widget Name]
-    drawUI conf uiState =
-      [ if uiState.displayFetchedDialog
-           then fetchedDialogWidget uiState
-           else emptyWidget
-      , runReader (campaignStatus uiState) conf ]
+  let drawUI :: Env -> UIState -> [Widget Name]
+      drawUI conf uiState =
+        [ if uiState.displayFetchedDialog
+            then fetchedDialogWidget uiState
+            else emptyWidget,
+          runReader (campaignStatus uiState) conf
+        ]
 
-    onEvent = \case
-      AppEvent (CampaignUpdated now tests c') ->
-        modify' $ \state -> state { campaigns = c', status = Running, now, tests }
-      AppEvent (FetchCacheUpdated contracts slots) ->
-        modify' $ \state ->
-          state { fetchedContracts = contracts
-                , fetchedSlots = slots }
-      AppEvent (EventReceived event@(time,campaignEvent)) -> do
-        modify' $ \state -> state { events = state.events |> event }
+      onEvent = \case
+        AppEvent (CampaignUpdated now tests c') ->
+          modify' $ \state -> state {campaigns = c', status = Running, now, tests}
+        AppEvent (FetchCacheUpdated contracts slots) ->
+          modify' $ \state ->
+            state
+              { fetchedContracts = contracts,
+                fetchedSlots = slots
+              }
+        AppEvent (EventReceived event@(time, campaignEvent)) -> do
+          modify' $ \state -> state {events = state.events |> event}
 
-        case campaignEvent of
-          WorkerEvent _ _ (NewCoverage { points, numCodehashes, corpusSize }) ->
-            modify' $ \state ->
-              state { coverage = max state.coverage points -- max not really needed
-                    , corpusSize
-                    , numCodehashes
-                    , lastNewCov = time
-                    }
-          WorkerEvent _ _ (WorkerStopped _) ->
-            modify' $ \state ->
-              state { workersAlive = state.workersAlive - 1
-                    , timeStopped = if state.workersAlive == 1
-                                       then Just time else Nothing
-                    }
-
-          _ -> pure ()
-      VtyEvent (EvKey (KChar 'f') _) ->
-        modify' $ \state ->
-          state { displayFetchedDialog = not state.displayFetchedDialog }
-      VtyEvent (EvKey (KChar 'l') _) ->
-        modify' $ \state ->
-          state { displayLogPane = not state.displayLogPane }
-      VtyEvent (EvKey (KChar 't') _) ->
-        modify' $ \state ->
-          state { displayTestsPane = not state.displayTestsPane }
-      VtyEvent (EvKey KEsc _)                         -> halt
-      VtyEvent (EvKey (KChar 'c') l) | MCtrl `elem` l -> halt
-      MouseDown (SBClick el n) _ _ _ ->
-        case n of
-          TestsViewPort -> do
-            let vp = viewportScroll TestsViewPort
-            case el of
-              SBHandleBefore -> vScrollBy vp (-1)
-              SBHandleAfter  -> vScrollBy vp 1
-              SBTroughBefore -> vScrollBy vp (-10)
-              SBTroughAfter  -> vScrollBy vp 10
-              SBBar          -> pure ()
-          LogViewPort -> do
-            let vp = viewportScroll LogViewPort
-            case el of
-              SBHandleBefore -> vScrollBy vp (-1)
-              SBHandleAfter  -> vScrollBy vp 1
-              SBTroughBefore -> vScrollBy vp (-10)
-              SBTroughAfter  -> vScrollBy vp 10
-              SBBar          -> pure ()
-          _ -> pure ()
-      _ -> pure ()
+          case campaignEvent of
+            WorkerEvent _ _ (NewCoverage {points, numCodehashes, corpusSize}) ->
+              modify' $ \state ->
+                state
+                  { coverage = max state.coverage points, -- max not really needed
+                    corpusSize,
+                    numCodehashes,
+                    lastNewCov = time
+                  }
+            WorkerEvent _ _ (WorkerStopped _) ->
+              modify' $ \state ->
+                state
+                  { workersAlive = state.workersAlive - 1,
+                    timeStopped =
+                      if state.workersAlive == 1
+                        then Just time
+                        else Nothing
+                  }
+            _ -> pure ()
+        VtyEvent (EvKey (KChar 'f') _) ->
+          modify' $ \state ->
+            state {displayFetchedDialog = not state.displayFetchedDialog}
+        VtyEvent (EvKey (KChar 'l') _) ->
+          modify' $ \state ->
+            state {displayLogPane = not state.displayLogPane}
+        VtyEvent (EvKey (KChar 't') _) ->
+          modify' $ \state ->
+            state {displayTestsPane = not state.displayTestsPane}
+        VtyEvent (EvKey KEsc _) -> halt
+        VtyEvent (EvKey (KChar 'c') l) | MCtrl `elem` l -> halt
+        MouseDown (SBClick el n) _ _ _ ->
+          case n of
+            TestsViewPort -> do
+              let vp = viewportScroll TestsViewPort
+              case el of
+                SBHandleBefore -> vScrollBy vp (-1)
+                SBHandleAfter -> vScrollBy vp 1
+                SBTroughBefore -> vScrollBy vp (-10)
+                SBTroughAfter -> vScrollBy vp 10
+                SBBar -> pure ()
+            LogViewPort -> do
+              let vp = viewportScroll LogViewPort
+              case el of
+                SBHandleBefore -> vScrollBy vp (-1)
+                SBHandleAfter -> vScrollBy vp 1
+                SBTroughBefore -> vScrollBy vp (-10)
+                SBTroughAfter -> vScrollBy vp 10
+                SBBar -> pure ()
+            _ -> pure ()
+        _ -> pure ()
 
   env <- ask
-  pure $ App { appDraw = drawUI env
-             , appStartEvent = pure ()
-             , appHandleEvent = onEvent
-             , appAttrMap = const attrs
-             , appChooseCursor = neverShowCursor
-             }
+  pure $
+    App
+      { appDraw = drawUI env,
+        appStartEvent = pure (),
+        appHandleEvent = onEvent,
+        appAttrMap = const attrs,
+        appChooseCursor = neverShowCursor
+      }
 
 -- | Heuristic check that we're in a sensible terminal (not a pipe)
 isTerminal :: IO Bool
 isTerminal = hNowSupportsANSI stdout
 
 -- | Composes a compact text status line of the campaign
-statusLine
-  :: Env
-  -> [WorkerState]
-  -> IO String
+statusLine ::
+  Env ->
+  [WorkerState] ->
+  IO String
 statusLine env states = do
   tests <- traverse readIORef env.testRefs
   (points, _) <- coverageStats env.coverageRefInit env.coverageRefRuntime
   corpus <- readIORef env.corpusRef
   let totalCalls = sum ((.ncalls) <$> states)
-  pure $ "tests: " <> show (length $ filter didFail tests) <> "/" <> show (length tests)
-    <> ", fuzzing: " <> show totalCalls <> "/" <> show env.cfg.campaignConf.testLimit
-    <> ", values: " <> show ((.value) <$> filter isOptimizationTest tests)
-    <> ", cov: " <> show points
-    <> ", corpus: " <> show (Corpus.corpusSize corpus)
-
+  let totalAvgGenTime = (sum ((.avgGenTime) <$> states) / fromIntegral (length states)) * 1000
+  let totalAvgExecTime = (sum ((.avgExecTime) <$> states) / fromIntegral (length states)) * 1000
+  let totalGenTime = sum ((.totalGenTime) <$> states) * 1000
+  let totalExecTime = sum ((.totalExecTime) <$> states) * 1000
+  pure $
+    "tests: "
+      <> show (length $ filter didFail tests)
+      <> "/"
+      <> show (length tests)
+      <> ", fuzzing: "
+      <> show totalCalls
+      <> "/"
+      <> show env.cfg.campaignConf.testLimit
+      <> ", values: "
+      <> show ((.value) <$> filter isOptimizationTest tests)
+      <> ", cov: "
+      <> show points
+      <> ", corpus: "
+      <> show (Corpus.corpusSize corpus)
+      <> ", avg gen: "
+      <> printf "%.2f ms" totalAvgGenTime
+      <> ", avg exec: "
+      <> printf "%.2f ms" totalAvgExecTime
+      <> ", total gen: "
+      <> printf "%.2f ms" totalGenTime
+      <> ", total exec: "
+      <> printf "%.2f ms" totalExecTime

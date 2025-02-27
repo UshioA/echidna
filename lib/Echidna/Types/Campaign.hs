@@ -1,16 +1,19 @@
 module Echidna.Types.Campaign where
 
 import Control.Concurrent (ThreadId)
+import Control.Monad.IO.Class (liftIO)
 import Data.Aeson
 import Data.Map (Map)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Time (LocalTime (LocalTime))
 import Data.Word (Word16, Word8)
 import Echidna.ABI (GenDict, emptyDict, encodeSig)
 import Echidna.Types
 import Echidna.Types.Coverage (CoverageFileType, CoverageMap)
 import Echidna.Types.Test (EchidnaTest (..), TestType (..))
 import Echidna.Types.Tx (Tx)
+import Echidna.Utility (getTimestamp)
 import GHC.Conc (numCapabilities)
 
 -- | Configuration for running an Echidna 'Campaign'.
@@ -177,6 +180,12 @@ data WorkerState = WorkerState
     ncallseqs :: !Int,
     -- | Number of calls executed while fuzzing
     ncalls :: !Int,
+    -- | When worker started to work
+    totalGenTime :: Double, -- 总的生成时间（秒）
+    totalExecTime :: Double, -- 总的执行时间（秒）
+    avgGenTime :: Double, -- 平均生成时间
+    avgExecTime :: Double, -- 平均执行时间
+
     -- | Flag to indicate that the callseq has reverted
     callseqReverted :: !Bool,
     -- | Number of calls executed before the first revert
@@ -197,6 +206,10 @@ initialWorkerState =
       newCoverage = False,
       ncallseqs = 0,
       ncalls = 0,
+      totalGenTime = 0,
+      totalExecTime = 0,
+      avgGenTime = 0,
+      avgExecTime = 0,
       callseqReverted = False,
       revertAt = 0,
       totalGas = 0,

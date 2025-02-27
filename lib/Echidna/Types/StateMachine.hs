@@ -8,6 +8,7 @@ import Data.Text qualified as T
 -- 定义数据结构
 data StateMachine = StateMachine
   { states :: [T.Text],
+    contracts :: T.Text,
     transitionsAccept :: HM.Map T.Text [T.Text],
     transitionsReject :: HM.Map T.Text [T.Text]
   }
@@ -18,7 +19,8 @@ instance FromJSON StateMachine where
   parseJSON (Object v) = do
     stateMachine <- v .: "state_machine"
     states <- stateMachine .: "states"
+    contract <- v .: "contract"
     transitionsAccept <- stateMachine .:? "transitions_accept" .!= HM.empty
     transitionsReject <- stateMachine .:? "transitions_reject" .!= HM.empty
-    return $ StateMachine states transitionsAccept transitionsReject
+    return $ StateMachine states contract transitionsAccept transitionsReject
   parseJSON _ = mzero
